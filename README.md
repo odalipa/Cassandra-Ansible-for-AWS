@@ -1,4 +1,266 @@
-# Cassandra storage config YAML
+
+
+AWS
+
+1.Make an AWS account 
+2.Create an IAM role and obtain your access and secret keys 
+3.Generate a public/private key pair. 
+
+
+From your MAC Laptop:
+
+
+Note: Ansible uses boto and boto3 module
+1. pip install boto boto3
+2. Create Ansible vault to store AWS Keys
+   - ansible-vault create aws_keys.yml
+     aws_access_key: XXXXXXXXXXXXXXXXX
+     aws_secret_key: XXXXXXXXXXXXXXXXXXXXX
+3. cat aws_keys.yml 
+   ( encrypted keys )
+4. Add Local section to the host file
+   [local]
+   localhost
+
+5. aws_provisioning.yml ( aws1.yml )
+   ---
+- hosts: local
+  connection: local
+  gather_facts: False
+  vars:
+    instance_type: t2.micro
+    security_group: cassandra_sg
+    image: ami-xxxxxxxx
+    keypair: apilado 
+    region: us-west-2
+    count: 3
+  vars_files:
+    - aws_keys.yml
+
+
+6. aws_provisioning.yml ( aws2.yml )
+
+tasks:
+    - name: Create a security group
+      ec2_group:
+        name: "{{ security_group }}"
+        description: The webservers security group
+        region: "{{ region }}"
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+
+7. Launch the EC2 Instances - aws_provisioning.yml ( aws3.yml )
+
+- name: Launch the new EC2 Instance
+      ec2:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        group: "{{ security_group }}"
+        instance_type: "{{ instance_type }}"
+        image: "{{ image }}"
+        wait: true 
+        region: "{{ region }}"
+        keypair: "{{ keypair }}"
+        count: "{{count}}"
+      register: ec2
+
+
+8. aws_provisioning.yml - ( aws4.yml )
+    - name: Add the newly created host so that we can further contact it
+      add_host:
+        name: "{{ item.public_ip }}"
+        groups: cassandra_servers
+      with_items: "{{ ec2.instances }}"
+
+9. Tag the Instances  - aws_provisioning.yml ( ( aws5.yml )
+
+    - name: Add tag to Instance(s)
+      ec2_tag:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        resource: "{{ item.id }}" 
+        region: "{{ region }}" 
+        state: "present"
+      with_items: "{{ ec2.instances }}"
+      args:
+        tags:
+          Type: cassandra_servers
+
+10. Check that the EC2 instances are up and ready to connect to - aws_provisioning.yml ( aws6.yml )
+
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ item.public_ip }}"
+        port: 22 
+        state: started 
+      with_items: "{{ ec2.instances }}"
+
+11. Override the default /etc/ansible and create ansible.cfg in the working directory
+
+[defaults]
+
+host_key_checking = False
+
+private_key_file = /Users/marianoapilado/.ssh/apilado.pem
+
+12. Run ansible-playbook
+    ansible-playbook -i hosts --ask-vault-pass aws_provisioning.yml
+
+    Check the AWS Console for the ec2 instances and ensure they are in the correct security group
+
+To termionate the ec2 instances:
+
+ec2_down.yml
+
+- hosts: local
+  connection: local
+  vars:
+    region: us-west-2
+  vars_files:
+    - aws_keys.yml
+  tasks:
+    - name: Gather EC2 facts
+      ec2_instance_facts:
+        region: "{{ region }}"
+        filters:
+          "tag:Type": "cassandra_server"
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+      register: ec2
+    - debug: var=ec2
+
+    - name: Terminate EC2 Instance(s)
+      ec2:
+        instance_ids: '{{ item.instance_id }}'
+        state: absent
+        region: "{{ region }}"
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+      with_items: "{{ ec2.instances }}"
+
+ansible-playbook -i hosts --ask-vault-pass ec2_down.yml
+
+
+Setup Ansible Directory like this to install Cassandra on the EC2 instances
+
+|----ansible.cfg
+|----hosts
+|----Playbook.yml
+|----roles
+     |---installation
+         |------files
+         |      |-- apache-cassandra-3.11.2-bin.tar.gz 
+         |      |-- jdk-10_linux-x64_bin.rpm
+         |
+         |______tasks
+         |      |__ main.yml
+         |
+         |_____ templates
+                |__ cassandra.yml
+
+
+1. Create two or three instances of AWS EC2 that will serve as the nodes in a cluster.
+2. Create a security group to allow all connections and add the nodes to that security groups.
+   Note: You can use terraform or aws cli for this
+
+3. Create an inventory that has the IP addresses of the nodes.
+4. Add the inventory file into the configuration file of the Ansible, e.g. ansible.cfg.
+
+
+ansible.cfg
+[defaults] 
+hostfile = ./hosts
+roles_path = ./roles
+
+
+Note: Replace IPs with newly created AWS IPs
+
+hosts
+[aws-cassandra]
+13.127.1.226
+35.154.11.168
+13.126.46.0
+
+
+Note: Replace seeds: with newly created ec2 ip
+
+Playbook.yml
+
+---
+- hosts: aws-cassandra
+  gather_facts: yes
+  remote_user: ec2-user
+  become: yes
+  vars:
+    cluster_name: Test_Cluster
+    seeds: 13.127.1.226
+  roles:
+    - installation
+
+
+The Role "installation" will:
+1. Install JRE
+2. Add and unpack the Apache Cassandra tar.
+3. Replace the cassandra.yaml having default configurations with cassandra.yaml with our own configurations
+4. Ensure Cassandra is started.
+
+====================================================================
+
+main.yml
+
+---
+- name: Copy Cassandra tar
+  copy:
+     src: apache-cassandra-3.11.2-bin.tar.gz
+     dest: /tmp/apache-cassandra-3.11.2-bin.tar.gz
+
+- name: Extract Cassandra
+  command: tar -xvf /tmp/apache-cassandra-3.11.2-bin.tar.gz
+
+- name: override cassandra.yaml file
+  template: src=cassandra.yaml dest=apache-cassandra-3.11.2/conf/
+
+- name: Run Cassandra from bin folder
+  command: ./cassandra -fR
+  args:
+    chdir: /home/ec2-user/apache-cassandra-3.11.2/bin/
+
+
+====================================================================
+
+
+The cassandra.yml contains most of the Cassandra configuration Edit this file on each node.
+
+The template cassandra.yaml uses the following variables:
+
+1. cluster_name: '{{ cluster_name }}' can be anything chosen by you to describe the name of the cluster.
+2. seeds: "{{ seeds }}" are the IP addresses of the clusters seed servers.
+3. listen_address: {{ aws-cassandra }} is the IP address that Cassandra will listen on for internal (Cassandra to Cassandra) communication will occur.
+4. rpc_address: {{ aws-cassandra }} is the IP address that Cassandra will listen on for client-based communication.
+5. Run  ansible-playbook -i hosts --ask-vault-pass Playbook.yml
+6. Add more nodes to the list by simply adding them to the host list
+
+
+
+- template for cassandra.yml
+
+R# Cassandra storage config YAML
 
 # NOTE:
 #   See http://wiki.apache.org/cassandra/StorageConfiguration for
@@ -1235,3 +1497,9 @@ back_pressure_strategy:
 # An interval of 0 disables any wait time, which is the behavior of former Cassandra versions.
 #
 # otc_backlog_expiration_interval_ms: 200
+
+
+
+
+
+
